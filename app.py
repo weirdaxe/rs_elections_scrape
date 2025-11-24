@@ -480,9 +480,9 @@ Scrapes polling station data from:
                     else:
                         details = "no basic info parsed (HTTP error, empty body, or parse failure)"
 
-                    log_lines_bi.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
-                    log_text = "\n".join(log_lines_bi[-200:])
-                    log_box_bi.text(log_text)
+                    # log_lines_bi.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
+                    # log_text = "\n".join(log_lines_bi[-200:])
+                    # log_box_bi.text(log_text)
 
                     if raw_response:
                         raw_box_bi.text(raw_response[:4000])
