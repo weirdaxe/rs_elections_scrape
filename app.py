@@ -11,7 +11,7 @@ DEFAULT_WEBRESULT_KEY = "WebResult_2022GENP1_2025_11_19_14_41_56"
 def parse_xml_candidates(xml_text: str):
     """
     Parse one XML response and return list of (candidate_name, total_votes).
-    Robust to empty or malformed XML.
+    Robust to empty or malformed XML and to namespaces.
     """
     if not xml_text:
         return []
@@ -26,7 +26,9 @@ def parse_xml_candidates(xml_text: str):
         # Malformed XML – treat as no data for this polling station
         return []
 
-    # Handle XML namespace if present
+    candidates = []
+
+    # --- First attempt: namespace-aware parsing (original logic) ----------------
     if root.tag.startswith("{"):
         ns_uri = root.tag.split("}")[0].strip("{")
         ns = {"ns": ns_uri}
@@ -39,8 +41,6 @@ def parse_xml_candidates(xml_text: str):
         name_tag = "Name"
         votes_tag = "TotalVotes"
 
-    candidates = []
-
     for elem in root.findall(item_tag, ns):
         name_elem = elem.find(name_tag, ns)
         votes_elem = elem.find(votes_tag, ns)
@@ -49,13 +49,37 @@ def parse_xml_candidates(xml_text: str):
             continue
 
         name = name_elem.text.strip()
-
         try:
             votes = int(votes_elem.text) if votes_elem is not None and votes_elem.text else 0
         except (ValueError, TypeError):
             votes = 0
 
         candidates.append((name, votes))
+
+    # --- Fallback: namespace-agnostic, using local tag names -------------------
+    if not candidates:
+        for elem in root:
+            elem_local = elem.tag.split("}")[-1]
+
+            if elem_local != "Race5_PollingStationsCandidatesResult":
+                continue
+
+            name_text = None
+            votes_val = 0
+
+            for child in elem:
+                child_local = child.tag.split("}")[-1]
+
+                if child_local == "Name":
+                    name_text = (child.text or "").strip()
+                elif child_local == "TotalVotes":
+                    try:
+                        votes_val = int(child.text) if child.text else 0
+                    except (ValueError, TypeError):
+                        votes_val = 0
+
+            if name_text:
+                candidates.append((name_text, votes_val))
 
     return candidates
 
@@ -65,7 +89,8 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
     Scrape polling stations from start_id to end_id (inclusive) and
     return a DataFrame: rows = polling_station_id, columns = candidate names.
 
-    progress_callback(current_index, total, polling_id, station_result_dict)
+    progress_callback signature:
+        progress_callback(current_index, total, polling_id, station_result_dict, raw_xml)
     """
     base_url = (
         "https://www.izbori.ba/api_2018/"
@@ -78,30 +103,33 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
 
     total = end_id - start_id + 1
 
-    # tqdm for server logs
+    # tqdm for server logs (if running in terminal)
     for idx, polling_id in enumerate(
         tqdm(range(start_id, end_id + 1), desc="Scraping", unit="station"),
         start=1
     ):
         url = base_url.format(polling_id=polling_id)
 
+        station_result = {}
+        raw_xml = ""
+
         try:
             resp = session.get(url, timeout=10)
+            raw_xml = resp.text
         except Exception:
-            station_result = {}
             results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id, station_result)
+                progress_callback(idx, total, polling_id, station_result, raw_xml)
             continue
 
         if resp.status_code != 200:
-            station_result = {}
             results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id, station_result)
+                progress_callback(idx, total, polling_id, station_result, raw_xml)
             continue
 
-        candidates = parse_xml_candidates(resp.text)
+        # Parse XML
+        candidates = parse_xml_candidates(raw_xml)
 
         station_result = {}
         for name, votes in candidates:
@@ -111,8 +139,9 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         results_by_station[polling_id] = station_result
 
         if progress_callback:
-            progress_callback(idx, total, polling_id, station_result)
+            progress_callback(idx, total, polling_id, station_result, raw_xml)
 
+    # Build DataFrame
     all_candidates = sorted(all_candidates)
 
     data = []
@@ -160,17 +189,20 @@ Scrapes polling station candidate results from:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
-        # "Print box" for live log of results
-        st.subheader("Live scrape log")
+        # Parsed results log
+        st.subheader("Live scrape log (parsed)")
         log_box = st.empty()
         log_lines = []
 
-        def progress_callback(current_index, total, current_polling_id, station_result):
+        # Raw XML log (last response only)
+        st.subheader("Last raw XML response")
+        raw_box = st.empty()
+
+        def progress_callback(current_index, total, current_polling_id, station_result, raw_xml):
             frac = current_index / total
             progress_bar.progress(frac)
             status_text.text(
-                f"Scraping {current_index}/{total} "
-                f"(polling station ID {current_polling_id})"
+                f"Scraping {current_index}/{total} (polling station ID {current_polling_id})"
             )
 
             if station_result:
@@ -178,12 +210,15 @@ Scrapes polling station candidate results from:
                     f"{name}={votes}" for name, votes in station_result.items()
                 )
             else:
-                details = "no data (error or empty response)"
+                details = "no candidates parsed (HTTP error, empty XML, or parse failure)"
 
             log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
-            # Keep last 200 lines to avoid huge text
-            log_text = "\n".join(log_lines[-200:])
+            log_text = "\n".join(log_lines[-200:])  # keep last 200 lines
             log_box.text(log_text)
+
+            # Show truncated raw XML for the latest request
+            if raw_xml:
+                raw_box.text(raw_xml[:4000])  # truncate if very long
 
         st.write("Scraping in progress...")
 
