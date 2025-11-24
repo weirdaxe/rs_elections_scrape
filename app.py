@@ -170,7 +170,7 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         raw_response = ""
 
         try:
-            resp = session.get(url, timeout=10)
+            resp = session.get(url, timeout=1)
             raw_response = resp.text
         except Exception:
             results_by_station[polling_id] = station_result
