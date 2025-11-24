@@ -2,10 +2,55 @@ import streamlit as st
 import requests
 import xml.etree.ElementTree as ET
 import pandas as pd
+import json
 from tqdm import tqdm
 
 # Default WebResult key from your example; change via UI if needed
 DEFAULT_WEBRESULT_KEY = "WebResult_2022GENP1_2025_11_19_14_41_56"
+
+
+def parse_json_candidates(text: str):
+    """
+    Try to parse candidates from JSON text.
+    Expects a list of objects with at least 'name' and 'totalVotes' keys.
+    """
+    if not text:
+        return []
+
+    s = text.strip()
+    if not s:
+        return []
+
+    try:
+        if s[0] not in ("[", "{"):
+            return []
+        data = json.loads(s)
+    except Exception:
+        return []
+
+    candidates = []
+
+    # If it's a list of candidate objects
+    if isinstance(data, list):
+        iterable = data
+    else:
+        # If it's a dict, try common wrappers, otherwise treat as single item
+        iterable = data.get("results") or data.get("Candidates") or [data]
+
+    for item in iterable:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name") or item.get("Name")
+        votes = item.get("totalVotes") or item.get("TotalVotes") or 0
+        if not name:
+            continue
+        try:
+            votes = int(votes)
+        except (ValueError, TypeError):
+            votes = 0
+        candidates.append((name.strip(), votes))
+
+    return candidates
 
 
 def parse_xml_candidates(xml_text: str):
@@ -23,12 +68,11 @@ def parse_xml_candidates(xml_text: str):
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
-        # Malformed XML – treat as no data for this polling station
         return []
 
     candidates = []
 
-    # --- First attempt: namespace-aware parsing (original logic) ----------------
+    # Namespace-aware attempt
     if root.tag.startswith("{"):
         ns_uri = root.tag.split("}")[0].strip("{")
         ns = {"ns": ns_uri}
@@ -56,11 +100,10 @@ def parse_xml_candidates(xml_text: str):
 
         candidates.append((name, votes))
 
-    # --- Fallback: namespace-agnostic, using local tag names -------------------
+    # Fallback: strip namespaces and inspect children
     if not candidates:
         for elem in root:
             elem_local = elem.tag.split("}")[-1]
-
             if elem_local != "Race5_PollingStationsCandidatesResult":
                 continue
 
@@ -84,13 +127,27 @@ def parse_xml_candidates(xml_text: str):
     return candidates
 
 
+def parse_candidates(raw_text: str):
+    """
+    Unified parser: try JSON first, then XML.
+    Returns list of (candidate_name, total_votes).
+    """
+    # JSON first (this matches the response you showed)
+    candidates = parse_json_candidates(raw_text)
+    if candidates:
+        return candidates
+
+    # Fallback to XML if JSON parsing yields nothing
+    return parse_xml_candidates(raw_text)
+
+
 def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_callback=None) -> pd.DataFrame:
     """
     Scrape polling stations from start_id to end_id (inclusive) and
     return a DataFrame: rows = polling_station_id, columns = candidate names.
 
     progress_callback signature:
-        progress_callback(current_index, total, polling_id, station_result_dict, raw_xml)
+        progress_callback(current_index, total, polling_id, station_result_dict, raw_response)
     """
     base_url = (
         "https://www.izbori.ba/api_2018/"
@@ -103,7 +160,6 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
 
     total = end_id - start_id + 1
 
-    # tqdm for server logs (if running in terminal)
     for idx, polling_id in enumerate(
         tqdm(range(start_id, end_id + 1), desc="Scraping", unit="station"),
         start=1
@@ -111,25 +167,25 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         url = base_url.format(polling_id=polling_id)
 
         station_result = {}
-        raw_xml = ""
+        raw_response = ""
 
         try:
             resp = session.get(url, timeout=10)
-            raw_xml = resp.text
+            raw_response = resp.text
         except Exception:
             results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id, station_result, raw_xml)
+                progress_callback(idx, total, polling_id, station_result, raw_response)
             continue
 
         if resp.status_code != 200:
             results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id, station_result, raw_xml)
+                progress_callback(idx, total, polling_id, station_result, raw_response)
             continue
 
-        # Parse XML
-        candidates = parse_xml_candidates(raw_xml)
+        # Parse (JSON or XML)
+        candidates = parse_candidates(raw_response)
 
         station_result = {}
         for name, votes in candidates:
@@ -139,7 +195,7 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         results_by_station[polling_id] = station_result
 
         if progress_callback:
-            progress_callback(idx, total, polling_id, station_result, raw_xml)
+            progress_callback(idx, total, polling_id, station_result, raw_response)
 
     # Build DataFrame
     all_candidates = sorted(all_candidates)
@@ -194,11 +250,11 @@ Scrapes polling station candidate results from:
         log_box = st.empty()
         log_lines = []
 
-        # Raw XML log (last response only)
-        st.subheader("Last raw XML response")
+        # Raw response log (last response only)
+        st.subheader("Last raw response (JSON/XML)")
         raw_box = st.empty()
 
-        def progress_callback(current_index, total, current_polling_id, station_result, raw_xml):
+        def progress_callback(current_index, total, current_polling_id, station_result, raw_response):
             frac = current_index / total
             progress_bar.progress(frac)
             status_text.text(
@@ -210,15 +266,14 @@ Scrapes polling station candidate results from:
                     f"{name}={votes}" for name, votes in station_result.items()
                 )
             else:
-                details = "no candidates parsed (HTTP error, empty XML, or parse failure)"
+                details = "no candidates parsed (HTTP error, empty body, or parse failure)"
 
             log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
             log_text = "\n".join(log_lines[-200:])  # keep last 200 lines
             log_box.text(log_text)
 
-            # Show truncated raw XML for the latest request
-            if raw_xml:
-                raw_box.text(raw_xml[:4000])  # truncate if very long
+            if raw_response:
+                raw_box.text(raw_response[:4000])  # truncate if very long
 
         st.write("Scraping in progress...")
 
@@ -230,10 +285,8 @@ Scrapes polling station candidate results from:
         st.write(f"Rows (polling stations): {df.shape[0]}")
         st.write(f"Columns (candidates): {df.shape[1]}")
 
-        # Optional quick preview
         st.dataframe(df.head())
 
-        # Prepare CSV bytes directly for download
         csv_bytes = df.to_csv(encoding="utf-8").encode("utf-8")
 
         st.download_button(
