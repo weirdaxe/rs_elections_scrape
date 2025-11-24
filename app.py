@@ -132,22 +132,15 @@ def parse_candidates(raw_text: str):
     Unified parser: try JSON first, then XML.
     Returns list of (candidate_name, total_votes).
     """
-    # JSON first (this matches the response you showed)
     candidates = parse_json_candidates(raw_text)
     if candidates:
         return candidates
-
-    # Fallback to XML if JSON parsing yields nothing
     return parse_xml_candidates(raw_text)
 
 
-def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_callback=None) -> pd.DataFrame:
+def scrape_candidate_results(start_id: int, end_id: int, webresult_key: str, progress_callback=None) -> pd.DataFrame:
     """
-    Scrape polling stations from start_id to end_id (inclusive) and
-    return a DataFrame: rows = polling_station_id, columns = candidate names.
-
-    progress_callback signature:
-        progress_callback(current_index, total, polling_id, station_result_dict, raw_response)
+    Scrape candidate results from start_id to end_id (inclusive).
     """
     base_url = (
         "https://www.izbori.ba/api_2018/"
@@ -161,7 +154,7 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
     total = end_id - start_id + 1
 
     for idx, polling_id in enumerate(
-        tqdm(range(start_id, end_id + 1), desc="Scraping", unit="station"),
+        tqdm(range(start_id, end_id + 1), desc="Scraping candidates", unit="station"),
         start=1
     ):
         url = base_url.format(polling_id=polling_id)
@@ -170,7 +163,7 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         raw_response = ""
 
         try:
-            resp = session.get(url, timeout=1)
+            resp = session.get(url, timeout=10)
             raw_response = resp.text
         except Exception:
             results_by_station[polling_id] = station_result
@@ -184,7 +177,6 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
                 progress_callback(idx, total, polling_id, station_result, raw_response)
             continue
 
-        # Parse (JSON or XML)
         candidates = parse_candidates(raw_response)
 
         station_result = {}
@@ -197,7 +189,6 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         if progress_callback:
             progress_callback(idx, total, polling_id, station_result, raw_response)
 
-    # Build DataFrame
     all_candidates = sorted(all_candidates)
 
     data = []
@@ -215,14 +206,166 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
     return df
 
 
+def parse_basicinfo(raw_text: str):
+    """
+    Parse polling station basic info (ballot statistics) from JSON or XML.
+    Returns a dict of {field_name: value}.
+    """
+    if not raw_text:
+        return {}
+
+    s = raw_text.strip()
+    if not s:
+        return {}
+
+    # Try JSON first
+    try:
+        if s[0] in ("[", "{"):
+            data = json.loads(s)
+        else:
+            data = None
+    except Exception:
+        data = None
+
+    if data is not None:
+        obj = None
+
+        if isinstance(data, list):
+            if data and isinstance(data[0], dict):
+                obj = data[0]
+        elif isinstance(data, dict):
+            # If dict, either already the object or wrapped
+            # Simple heuristic: if any value is a dict and key looks like basic info, unwrap it
+            lower_keys = {k.lower(): k for k in data.keys()}
+            candidate_key = None
+            for k_lower, k_orig in lower_keys.items():
+                if "basicinfo" in k_lower or "race5_pollingstationsbasicinfo" in k_lower:
+                    candidate_key = k_orig
+                    break
+            if candidate_key and isinstance(data[candidate_key], dict):
+                obj = data[candidate_key]
+            else:
+                obj = data
+
+        if isinstance(obj, dict):
+            result = {}
+            for k, v in obj.items():
+                # Try to coerce numeric values
+                if isinstance(v, (int, float)):
+                    result[k] = v
+                else:
+                    try:
+                        fv = float(v)
+                        # cast to int if it's an integer
+                        if fv.is_integer():
+                            result[k] = int(fv)
+                        else:
+                            result[k] = fv
+                    except Exception:
+                        result[k] = v
+            return result
+
+    # Fallback: XML
+    try:
+        root = ET.fromstring(s)
+    except ET.ParseError:
+        return {}
+
+    result = {}
+    for child in root:
+        key = child.tag.split("}")[-1]
+        text = (child.text or "").strip()
+        if not text:
+            result[key] = 0
+            continue
+        try:
+            fv = float(text)
+            if fv.is_integer():
+                result[key] = int(fv)
+            else:
+                result[key] = fv
+        except Exception:
+            result[key] = text
+
+    return result
+
+
+def scrape_basicinfo(start_id: int, end_id: int, webresult_key: str, progress_callback=None) -> pd.DataFrame:
+    """
+    Scrape polling station basic info (ballot statistics) from start_id to end_id (inclusive).
+    """
+    base_url = (
+        "https://www.izbori.ba/api_2018/"
+        "race5_pollingstationsbasicinfo/%22" + webresult_key + "%22/{polling_id}"
+    )
+
+    all_fields = set()
+    results_by_station = {}
+    session = requests.Session()
+
+    total = end_id - start_id + 1
+
+    for idx, polling_id in enumerate(
+        tqdm(range(start_id, end_id + 1), desc="Scraping basic info", unit="station"),
+        start=1
+    ):
+        url = base_url.format(polling_id=polling_id)
+
+        station_result = {}
+        raw_response = ""
+
+        try:
+            resp = session.get(url, timeout=10)
+            raw_response = resp.text
+        except Exception:
+            results_by_station[polling_id] = station_result
+            if progress_callback:
+                progress_callback(idx, total, polling_id, station_result, raw_response)
+            continue
+
+        if resp.status_code != 200:
+            results_by_station[polling_id] = station_result
+            if progress_callback:
+                progress_callback(idx, total, polling_id, station_result, raw_response)
+            continue
+
+        info = parse_basicinfo(raw_response)
+
+        station_result = info
+        for field in info.keys():
+            all_fields.add(field)
+
+        results_by_station[polling_id] = station_result
+
+        if progress_callback:
+            progress_callback(idx, total, polling_id, station_result, raw_response)
+
+    all_fields = sorted(all_fields)
+
+    data = []
+    index = []
+
+    for polling_id in sorted(results_by_station.keys()):
+        station_result = results_by_station[polling_id]
+        row = [station_result.get(field, 0) for field in all_fields]
+        data.append(row)
+        index.append(polling_id)
+
+    df = pd.DataFrame(data, index=index, columns=all_fields)
+    df.index.name = "polling_station_id"
+
+    return df
+
+
 def main():
     st.title("Izbori Polling Station Scraper")
 
     st.markdown(
         """
-Scrapes polling station candidate results from:
+Scrapes polling station data from:
 
-`https://www.izbori.ba/api_2018/race5_pollingstationscandidatesresult/...`
+- Candidate results endpoint  
+- Polling box statistics (basic info) endpoint
         """
     )
 
@@ -231,70 +374,139 @@ Scrapes polling station candidate results from:
         value=DEFAULT_WEBRESULT_KEY,
     )
 
-    col1, col2 = st.columns(2)
-    start_id = col1.number_input("Start polling station ID", min_value=1, value=2, step=1)
-    end_id = col2.number_input("End polling station ID", min_value=1, value=2165, step=1)
+    tab_candidates, tab_basicinfo = st.tabs(["Candidate results", "Polling box stats"])
 
-    if start_id > end_id:
-        st.error("Start ID must be <= End ID")
-        return
+    with tab_candidates:
+        st.header("Candidate results")
 
-    run_button = st.button("Run scraper and generate CSV")
+        col1, col2 = st.columns(2)
+        start_id = col1.number_input("Start polling station ID", min_value=1, value=2, step=1, key="cand_start")
+        end_id = col2.number_input("End polling station ID", min_value=1, value=2165, step=1, key="cand_end")
 
-    if run_button:
-        progress_bar = st.progress(0.0)
-        status_text = st.empty()
+        if start_id > end_id:
+            st.error("Start ID must be <= End ID")
+        else:
+            run_button = st.button("Run candidate scraper and generate CSV")
 
-        # Parsed results log
-        st.subheader("Live scrape log (parsed)")
-        log_box = st.empty()
-        log_lines = []
+            if run_button:
+                progress_bar = st.progress(0.0)
+                status_text = st.empty()
 
-        # Raw response log (last response only)
-        st.subheader("Last raw response (JSON/XML)")
-        raw_box = st.empty()
+                # Parsed results log
+                st.subheader("Live scrape log (parsed)")
+                log_box = st.empty()
+                log_lines = []
 
-        def progress_callback(current_index, total, current_polling_id, station_result, raw_response):
-            frac = current_index / total
-            progress_bar.progress(frac)
-            status_text.text(
-                f"Scraping {current_index}/{total} (polling station ID {current_polling_id})"
-            )
+                # Raw response log
+                st.subheader("Last raw response (JSON/XML)")
+                raw_box = st.empty()
 
-            if station_result:
-                details = ", ".join(
-                    f"{name}={votes}" for name, votes in station_result.items()
+                def progress_callback(current_index, total, current_polling_id, station_result, raw_response):
+                    frac = current_index / total
+                    progress_bar.progress(frac)
+                    status_text.text(
+                        f"Scraping {current_index}/{total} (polling station ID {current_polling_id})"
+                    )
+
+                    if station_result:
+                        details = ", ".join(
+                            f"{name}={votes}" for name, votes in station_result.items()
+                        )
+                    else:
+                        details = "no candidates parsed (HTTP error, empty body, or parse failure)"
+
+                    # log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
+                    # log_text = "\n".join(log_lines[-200:])
+                    # log_box.text(log_text)
+
+                    if raw_response:
+                        raw_box.text(raw_response[:4000])
+
+                st.write("Scraping candidate results...")
+
+                df = scrape_candidate_results(int(start_id), int(end_id), webresult_key, progress_callback)
+
+                status_text.text("Scraping finished.")
+                progress_bar.progress(1.0)
+
+                st.write(f"Rows (polling stations): {df.shape[0]}")
+                st.write(f"Columns (candidates): {df.shape[1]}")
+
+                st.dataframe(df.head())
+
+                csv_bytes = df.to_csv(encoding="utf-8").encode("utf-8")
+
+                st.download_button(
+                    label="Download candidate results CSV",
+                    data=csv_bytes,
+                    file_name="polling_station_candidate_results.csv",
+                    mime="text/csv",
                 )
-            else:
-                details = "no candidates parsed (HTTP error, empty body, or parse failure)"
 
-            # log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
-            # log_text = "\n".join(log_lines[-200:])  # keep last 200 lines
-            # log_box.text(log_text)
+    with tab_basicinfo:
+        st.header("Polling box statistics (basic info)")
 
-            if raw_response:
-                raw_box.text(raw_response[:4000])  # truncate if very long
+        col1, col2 = st.columns(2)
+        start_id_bi = col1.number_input("Start polling station ID", min_value=1, value=2, step=1, key="bi_start")
+        end_id_bi = col2.number_input("End polling station ID", min_value=1, value=2165, step=1, key="bi_end")
 
-        st.write("Scraping in progress...")
+        if start_id_bi > end_id_bi:
+            st.error("Start ID must be <= End ID")
+        else:
+            run_button_bi = st.button("Run basic info scraper and generate CSV")
 
-        df = scrape_results(int(start_id), int(end_id), webresult_key, progress_callback)
+            if run_button_bi:
+                progress_bar_bi = st.progress(0.0)
+                status_text_bi = st.empty()
 
-        status_text.text("Scraping finished.")
-        progress_bar.progress(1.0)
+                st.subheader("Live scrape log (parsed)")
+                log_box_bi = st.empty()
+                log_lines_bi = []
 
-        st.write(f"Rows (polling stations): {df.shape[0]}")
-        st.write(f"Columns (candidates): {df.shape[1]}")
+                st.subheader("Last raw response (JSON/XML)")
+                raw_box_bi = st.empty()
 
-        st.dataframe(df.head())
+                def progress_callback_bi(current_index, total, current_polling_id, station_result, raw_response):
+                    frac = current_index / total
+                    progress_bar_bi.progress(frac)
+                    status_text_bi.text(
+                        f"Scraping {current_index}/{total} (polling station ID {current_polling_id})"
+                    )
 
-        csv_bytes = df.to_csv(encoding="utf-8").encode("utf-8")
+                    if station_result:
+                        details = ", ".join(
+                            f"{k}={v}" for k, v in station_result.items()
+                        )
+                    else:
+                        details = "no basic info parsed (HTTP error, empty body, or parse failure)"
 
-        st.download_button(
-            label="Download CSV",
-            data=csv_bytes,
-            file_name="polling_station_results.csv",
-            mime="text/csv",
-        )
+                    log_lines_bi.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
+                    log_text = "\n".join(log_lines_bi[-200:])
+                    log_box_bi.text(log_text)
+
+                    if raw_response:
+                        raw_box_bi.text(raw_response[:4000])
+
+                st.write("Scraping polling box statistics...")
+
+                df_bi = scrape_basicinfo(int(start_id_bi), int(end_id_bi), webresult_key, progress_callback_bi)
+
+                status_text_bi.text("Scraping finished.")
+                progress_bar_bi.progress(1.0)
+
+                st.write(f"Rows (polling stations): {df_bi.shape[0]}")
+                st.write(f"Columns (stats fields): {df_bi.shape[1]}")
+
+                st.dataframe(df_bi.head())
+
+                csv_bytes_bi = df_bi.to_csv(encoding="utf-8").encode("utf-8")
+
+                st.download_button(
+                    label="Download polling box stats CSV",
+                    data=csv_bytes_bi,
+                    file_name="polling_station_basicinfo_results.csv",
+                    mime="text/csv",
+                )
 
 
 if __name__ == "__main__":
