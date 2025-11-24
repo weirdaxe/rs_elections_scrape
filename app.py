@@ -268,9 +268,9 @@ Scrapes polling station candidate results from:
             else:
                 details = "no candidates parsed (HTTP error, empty body, or parse failure)"
 
-            log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
-            log_text = "\n".join(log_lines[-200:])  # keep last 200 lines
-            log_box.text(log_text)
+            # log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
+            # log_text = "\n".join(log_lines[-200:])  # keep last 200 lines
+            # log_box.text(log_text)
 
             if raw_response:
                 raw_box.text(raw_response[:4000])  # truncate if very long
