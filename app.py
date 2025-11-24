@@ -64,6 +64,8 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
     """
     Scrape polling stations from start_id to end_id (inclusive) and
     return a DataFrame: rows = polling_station_id, columns = candidate names.
+
+    progress_callback(current_index, total, polling_id, station_result_dict)
     """
     base_url = (
         "https://www.izbori.ba/api_2018/"
@@ -86,15 +88,17 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         try:
             resp = session.get(url, timeout=10)
         except Exception:
-            results_by_station[polling_id] = {}
+            station_result = {}
+            results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id)
+                progress_callback(idx, total, polling_id, station_result)
             continue
 
         if resp.status_code != 200:
-            results_by_station[polling_id] = {}
+            station_result = {}
+            results_by_station[polling_id] = station_result
             if progress_callback:
-                progress_callback(idx, total, polling_id)
+                progress_callback(idx, total, polling_id, station_result)
             continue
 
         candidates = parse_xml_candidates(resp.text)
@@ -107,7 +111,7 @@ def scrape_results(start_id: int, end_id: int, webresult_key: str, progress_call
         results_by_station[polling_id] = station_result
 
         if progress_callback:
-            progress_callback(idx, total, polling_id)
+            progress_callback(idx, total, polling_id, station_result)
 
     all_candidates = sorted(all_candidates)
 
@@ -156,13 +160,30 @@ Scrapes polling station candidate results from:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
 
-        def progress_callback(current_index, total, current_polling_id):
+        # "Print box" for live log of results
+        st.subheader("Live scrape log")
+        log_box = st.empty()
+        log_lines = []
+
+        def progress_callback(current_index, total, current_polling_id, station_result):
             frac = current_index / total
             progress_bar.progress(frac)
             status_text.text(
                 f"Scraping {current_index}/{total} "
                 f"(polling station ID {current_polling_id})"
             )
+
+            if station_result:
+                details = ", ".join(
+                    f"{name}={votes}" for name, votes in station_result.items()
+                )
+            else:
+                details = "no data (error or empty response)"
+
+            log_lines.append(f"{current_index}/{total} | ID {current_polling_id}: {details}")
+            # Keep last 200 lines to avoid huge text
+            log_text = "\n".join(log_lines[-200:])
+            log_box.text(log_text)
 
         st.write("Scraping in progress...")
 
